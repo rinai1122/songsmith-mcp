@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "songsmith-mcp"
+version = "0.1.0"
+description = "MCP server for LLM-driven, human-in-the-loop song composition in REAPER"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Sungji Wang" }]
+dependencies = [
+    "mcp>=0.9.0",
+    "music21>=9.1",
+    "pyphen>=0.15",
+    "mido>=1.3",
+]
+
+[project.optional-dependencies]
+reaper = ["python-reapy>=0.10"]
+dev = ["pytest>=7", "pytest-asyncio>=0.23"]
+
+[project.scripts]
+songsmith-mcp = "songsmith_mcp.server:main"
+
+[tool.setuptools.packages.find]
+include = ["songsmith_mcp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
