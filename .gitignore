@@ -4,6 +4,8 @@ __pycache__/
 .venv/
 .pytest_cache/
 out/
+out_bench/
 tests/_out/
 *.mid
 *.rpp-bak
+.claude/scheduled_tasks.lock

@@ -35,18 +35,46 @@ _DISABLE_REAPER = os.environ.get("SONGSMITH_DISABLE_REAPER", "").strip().lower()
 class ReaperBridge:
     """Façade over python-reapy. Silently no-ops when not connected."""
 
+    # ``reapy.Project()`` has been observed to hang indefinitely on Windows
+    # when REAPER isn't running — the initial handshake blocks on a pipe that
+    # never opens. 2 s is plenty for the happy path and keeps ``reaper_status``
+    # (and every tool that touches the bridge lazily) responsive offline.
+    _CONNECT_TIMEOUT_S = 2.0
+
     def __init__(self, out_dir: str | Path | None = None) -> None:
         raw_out = out_dir or os.environ.get("SONGSMITH_OUT", "./out")
         self.out_dir = _sanitize_out_dir(str(raw_out))
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self._project = None
         self._connected = False
+        self._connect_timed_out = False
         if _HAVE_REAPY and not _DISABLE_REAPER:
+            self._try_connect(self._CONNECT_TIMEOUT_S)
+
+    def _try_connect(self, timeout_s: float) -> None:
+        import threading
+
+        result: dict[str, Any] = {}
+
+        def _worker() -> None:
             try:
-                self._project = reapy.Project()  # type: ignore[union-attr]
-                self._connected = True
-            except Exception:
-                self._connected = False
+                result["project"] = reapy.Project()  # type: ignore[union-attr]
+            except Exception as e:  # noqa: BLE001
+                result["error"] = e
+
+        t = threading.Thread(target=_worker, daemon=True)
+        t.start()
+        t.join(timeout_s)
+        if t.is_alive():
+            # The worker is stuck; mark offline and move on. The thread is a
+            # daemon, so it dies with the process — callers don't wait for it.
+            self._connected = False
+            self._project = None
+            self._connect_timed_out = True
+            return
+        if "project" in result:
+            self._project = result["project"]
+            self._connected = True
 
     # ----- status -------------------------------------------------------
 
@@ -59,6 +87,7 @@ class ReaperBridge:
             "reapy_installed": _HAVE_REAPY,
             "reaper_connected": self._connected,
             "reaper_disabled_by_env": _DISABLE_REAPER,
+            "reaper_connect_timed_out": self._connect_timed_out,
             "out_dir": str(self.out_dir.resolve()),
         }
 

@@ -7,8 +7,12 @@ pointing at this module.
 
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
+import threading
 from dataclasses import asdict
+from pathlib import Path
 from typing import Any
 
 from mcp.server import Server
@@ -21,13 +25,79 @@ from .arrangement import form as form_mod
 from . import direct_edit as edit_mod
 from .hitl import proposals as prop_mod
 from .hitl.explain import explain as _explain
-from .lyrics.align import DEFAULT_RHYTHMS, align_lyrics_to_rhythm, as_rhythm_template
+from .lyrics.align import DEFAULT_RHYTHMS, RHYTHM_TEMPLATES, align_lyrics_to_rhythm, as_rhythm_template
 from .lyrics.syllabify import count_syllables, syllabify
 from .reaper_bridge import get_bridge
+from .render import render_song as _render_song
+from .render.playback import open_with_default_app
+from .render.score import export_score as _export_score, find_musescore
 from .state import SongState, get_state, reset_state
 from .theory import chords as chords_mod
 from .theory import melody as melody_mod
 from .theory import voice_leading as vl_mod
+
+
+# ---------------------------------------------------------------------------
+# Nested schemas shared between build_song and render_section.
+#
+# Keeping these enums here means unknown styles fail at the MCP-schema layer
+# before ever reaching Python, and agents see the valid values in the tool
+# description — no more guessing which style strings are implemented.
+# ---------------------------------------------------------------------------
+
+def _drums_subschema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "description": "Same fields as write_drum_pattern.",
+        "properties": {
+            "style": {"type": "string", "enum": list(drums_mod.DRUM_STYLES)},
+            "intensity": {
+                "type": "string",
+                "enum": list(drums_mod.DRUM_INTENSITIES),
+                "default": "normal",
+            },
+            "track_name": {"type": "string", "default": "Drums"},
+            "fill": {"type": "boolean", "default": False},
+            "add_crash": {"type": "boolean"},
+        },
+    }
+
+
+def _bass_subschema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "description": "Same fields as write_bassline.",
+        "properties": {
+            "style": {"type": "string", "enum": list(bass_mod.BASS_STYLES)},
+            "track_name": {"type": "string", "default": "Bass"},
+            "seed": {"type": "integer"},
+        },
+    }
+
+
+def _melody_subschema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "description": "Same fields as propose_melody.",
+        "properties": {
+            "lyrics": {"type": "string", "default": ""},
+            "contour": {
+                "type": "string",
+                "enum": list(melody_mod.MELODY_CONTOURS),
+                "default": "arch",
+            },
+            "rhythm": {
+                "type": "string",
+                "enum": list(RHYTHM_TEMPLATES),
+                "default": "eighths",
+            },
+            "range_lo": {"type": "integer", "default": 57},
+            "range_hi": {"type": "integer", "default": 76},
+            "max_leap": {"type": "integer", "default": 7},
+            "seed": {"type": "integer"},
+            "track_name": {"type": "string", "default": "Melody"},
+        },
+    }
 
 
 server = Server("songsmith-mcp")
@@ -39,6 +109,161 @@ server = Server("songsmith-mcp")
 
 def _json(obj: Any) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps(obj, indent=2, default=str))]
+
+
+# ---------------------------------------------------------------------------
+# Background rendering
+#
+# The pure-numpy synth is fast per-note but scales linearly with total song
+# duration — a 10-section multi-track song can easily exceed the MCP client's
+# per-tool-call timeout (~60s-4min depending on client). Running it inline
+# from build_song means the client gives up on the call, the user never sees
+# the build result, and any subsequent tool call queues behind the still-in-
+# flight render.
+#
+# Solution: kick synth/score work onto a daemon thread, write the result (or
+# error) to a JSON sidecar in out_dir, and return from the tool call
+# immediately. The caller gets the build summary right away, plus a pointer
+# to the sidecar file they can poll (via ``observe`` or ``play_song``).
+# ---------------------------------------------------------------------------
+
+_BG_RENDER_LOCK = threading.Lock()
+_BG_RENDERS: dict[str, threading.Thread] = {}
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    """Write JSON to ``path`` via a tmp file + rename so readers never see a
+    half-written file mid-render."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2, default=str))
+    tmp.replace(path)
+
+
+def _start_background_render(
+    state: SongState,
+    out_dir: Path,
+    *,
+    basename: str,
+    emit_stems: bool,
+    emit_mp3: bool,
+    sidecar_name: str,
+) -> dict[str, Any]:
+    """Snapshot ``state`` and run ``render_song`` in a daemon thread.
+
+    The snapshot is vital: once this call returns, the caller may mutate the
+    SongState (add clips, accept proposals, re-build) while the synth is
+    still grinding on its copy. Without the deepcopy, those mutations would
+    corrupt the in-flight render.
+
+    Returns a status dict the caller can drop straight into their tool
+    response. No ``ok=True`` yet — that lands in the sidecar once the render
+    finishes.
+    """
+    snapshot = copy.deepcopy(state)
+    sidecar_path = out_dir / sidecar_name
+    # Mark as in-progress so stale results from a prior render don't confuse
+    # callers that poll the sidecar.
+    _write_json_atomic(sidecar_path, {
+        "ok": False,
+        "status": "rendering",
+        "basename": basename,
+    })
+
+    def _run() -> None:
+        try:
+            result = _render_song(
+                snapshot,
+                out_dir,
+                basename=basename,
+                emit_stems=emit_stems,
+                emit_mp3=emit_mp3,
+            )
+            _write_json_atomic(sidecar_path, {
+                "ok": bool(result.get("ok")),
+                "status": "done",
+                **result,
+            })
+        except Exception as e:  # noqa: BLE001 — must always finalize sidecar
+            _write_json_atomic(sidecar_path, {
+                "ok": False,
+                "status": "error",
+                "error": str(e),
+                "type": type(e).__name__,
+                "basename": basename,
+            })
+        finally:
+            with _BG_RENDER_LOCK:
+                _BG_RENDERS.pop(basename, None)
+
+    t = threading.Thread(target=_run, daemon=True, name=f"songsmith-render-{basename}")
+    with _BG_RENDER_LOCK:
+        _BG_RENDERS[basename] = t
+    t.start()
+
+    return {
+        "ok": True,
+        "status": "rendering_in_background",
+        "basename": basename,
+        "target_wav": str(out_dir / f"{basename}.wav"),
+        "target_mp3": str(out_dir / f"{basename}.mp3"),
+        "result_sidecar": str(sidecar_path),
+        "hint": (
+            "poll the sidecar or call play_song once status flips to 'done'. "
+            "the render is running in a daemon thread and will NOT block "
+            "other tool calls."
+        ),
+    }
+
+
+def _start_background_score(
+    state: SongState,
+    out_dir: Path,
+    *,
+    basename: str,
+    emit_png: bool,
+) -> dict[str, Any]:
+    """Same pattern as ``_start_background_render`` but for MusicXML / PNG
+    score export. MuseScore PNG rendering can stall on cold start, so we
+    treat it as a potentially-slow op even though XML alone is fast."""
+    snapshot = copy.deepcopy(state)
+    sidecar_path = out_dir / f"{basename}.score_result.json"
+    _write_json_atomic(sidecar_path, {
+        "ok": False,
+        "status": "exporting",
+        "basename": basename,
+    })
+
+    def _run() -> None:
+        try:
+            result = _export_score(
+                snapshot,
+                out_dir,
+                basename=basename,
+                emit_png=emit_png,
+            )
+            _write_json_atomic(sidecar_path, {
+                "ok": True,
+                "status": "done",
+                **result,
+            })
+        except Exception as e:  # noqa: BLE001
+            _write_json_atomic(sidecar_path, {
+                "ok": False,
+                "status": "error",
+                "error": str(e),
+                "type": type(e).__name__,
+            })
+
+    threading.Thread(target=_run, daemon=True, name=f"songsmith-score-{basename}").start()
+
+    return {
+        "ok": True,
+        "status": "exporting_in_background",
+        "basename": basename,
+        "target_musicxml": str(out_dir / f"{basename}.musicxml"),
+        "target_png": str(out_dir / f"{basename}.png"),
+        "result_sidecar": str(sidecar_path),
+    }
 
 
 def _chords_by_beat_for_section(section_name: str) -> tuple[dict[float, list[int]], int, int]:
@@ -96,13 +321,22 @@ def _build_melody_proposal(st: SongState, args: dict[str, Any]) -> Any:
     lyrics = args.get("lyrics", "") or ""
     if lyrics.strip():
         aligned = align_lyrics_to_rhythm(
-            lyrics, time_sig=st.time_sig, rhythm=args.get("rhythm", "eighths")
+            lyrics,
+            time_sig=st.time_sig,
+            bars_hint=st.section_by_name(section_name).bars,
+            rhythm=args.get("rhythm", "eighths"),
         )
         rhythm = as_rhythm_template(aligned)
         lyric_syls = [n.lyric for n in aligned.notes]
     else:
         bars = st.section_by_name(section_name).bars
-        one_bar = DEFAULT_RHYTHMS.get(args.get("rhythm", "eighths"), DEFAULT_RHYTHMS["eighths"])
+        rhythm_name = args.get("rhythm", "eighths")
+        if rhythm_name not in DEFAULT_RHYTHMS:
+            raise ValueError(
+                f"unknown rhythm {rhythm_name!r}; "
+                f"expected one of {list(DEFAULT_RHYTHMS.keys())}"
+            )
+        one_bar = DEFAULT_RHYTHMS[rhythm_name]
         rhythm = []
         for b in range(bars):
             off = b * beats_per_bar
@@ -171,6 +405,8 @@ def _build_bass_proposal(st: SongState, args: dict[str, Any]) -> Any:
 
 def _build_drums_proposal(st: SongState, args: dict[str, Any]) -> Any:
     section = st.section_by_name(args["section"])
+    fill = bool(args.get("fill", False))
+    add_crash = args.get("add_crash")
     clip = drums_mod.write_drum_pattern(
         section_name=section.name,
         track_name=args.get("track_name", "Drums"),
@@ -179,13 +415,22 @@ def _build_drums_proposal(st: SongState, args: dict[str, Any]) -> Any:
         bars=section.bars,
         start_bar=section.start_bar,
         time_sig=st.time_sig,
+        fill=fill,
+        add_crash=None if add_crash is None else bool(add_crash),
     )
+    flags = []
+    if fill:
+        flags.append("fill")
+    flag_str = f" [{', '.join(flags)}]" if flags else ""
     return prop_mod.create_proposal(
         kind="drums",
         section=section.name,
         track=args.get("track_name", "Drums"),
         clips=[clip],
-        summary=f"{args.get('style', 'pop')} drums ({args.get('intensity', 'normal')}), {section.bars} bars",
+        summary=(
+            f"{args.get('style', 'pop')} drums "
+            f"({args.get('intensity', 'normal')}), {section.bars} bars{flag_str}"
+        ),
         rationale=(
             "Kick on 1/3, snare on 2/4 is the backbeat. Hats subdivide the beat to set the feel."
         ),
@@ -216,8 +461,25 @@ async def _list_tools() -> list[Tool]:
         ),
         Tool(
             name="observe",
-            description="Return current song state (key, tempo, form, tracks, pending proposals, REAPER status).",
-            inputSchema={"type": "object", "properties": {}},
+            description=(
+                "Return the current song state. By default returns a compact "
+                "digest (key, tempo, form, per-track clip+note counts, pending "
+                "proposal summaries, REAPER status) that stays under a couple "
+                "KB regardless of song length. Set verbose=true to dump every "
+                "note of every clip — a 40-bar song can easily blow past MCP "
+                "payload limits in verbose mode, so prefer view_clip / "
+                "list_clips for targeted note inspection."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "verbose": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Include raw per-note data. Off by default.",
+                    }
+                },
+            },
         ),
         Tool(
             name="suggest_form",
@@ -321,8 +583,16 @@ async def _list_tools() -> list[Tool]:
                 "properties": {
                     "section": {"type": "string"},
                     "lyrics": {"type": "string", "default": ""},
-                    "contour": {"type": "string", "enum": ["arch", "descending", "ascending", "wave", "flat"], "default": "arch"},
-                    "rhythm": {"type": "string", "default": "eighths"},
+                    "contour": {
+                        "type": "string",
+                        "enum": list(melody_mod.MELODY_CONTOURS),
+                        "default": "arch",
+                    },
+                    "rhythm": {
+                        "type": "string",
+                        "enum": list(RHYTHM_TEMPLATES),
+                        "default": "eighths",
+                    },
                     "range_lo": {"type": "integer", "default": 57},
                     "range_hi": {"type": "integer", "default": 76},
                     "max_leap": {"type": "integer", "default": 7},
@@ -334,12 +604,16 @@ async def _list_tools() -> list[Tool]:
         ),
         Tool(
             name="write_bassline",
-            description="Write a bass part under the chord track in a section. style ∈ roots/root_fifth/walking/syncopated/arp.",
+            description="Write a bass part under the chord track in a section.",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "section": {"type": "string"},
-                    "style": {"type": "string", "default": "roots"},
+                    "style": {
+                        "type": "string",
+                        "enum": list(bass_mod.BASS_STYLES),
+                        "default": "roots",
+                    },
                     "track_name": {"type": "string", "default": "Bass"},
                     "seed": {"type": "integer"},
                 },
@@ -348,14 +622,35 @@ async def _list_tools() -> list[Tool]:
         ),
         Tool(
             name="write_drum_pattern",
-            description="Write a drum clip in a section. style ∈ rock/pop/ballad/halftime/edm/hiphop/jazz_swing.",
+            description=(
+                "Write a drum clip in a section. "
+                "intensity reshapes the pattern (light thins hats, heavy adds open hats + ghost snares). "
+                "Set fill=true on the bar before a chorus/drop — the last bar's second half becomes a tom fill."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {
                     "section": {"type": "string"},
-                    "style": {"type": "string", "default": "pop"},
-                    "intensity": {"type": "string", "enum": ["light", "normal", "heavy"], "default": "normal"},
+                    "style": {
+                        "type": "string",
+                        "enum": list(drums_mod.DRUM_STYLES),
+                        "default": "pop",
+                    },
+                    "intensity": {
+                        "type": "string",
+                        "enum": list(drums_mod.DRUM_INTENSITIES),
+                        "default": "normal",
+                    },
                     "track_name": {"type": "string", "default": "Drums"},
+                    "fill": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": "Replace the last bar's second half with a tom fill (for pre-chorus lifts).",
+                    },
+                    "add_crash": {
+                        "type": "boolean",
+                        "description": "Force a crash on bar 1 on/off. Defaults to true unless intensity=light.",
+                    },
                 },
                 "required": ["section"],
             },
@@ -368,9 +663,19 @@ async def _list_tools() -> list[Tool]:
                 "(required) plus optional drums/bass/melody. Equivalent to "
                 "calling render_section once per section — but one tool call "
                 "can lay down a whole multi-section song, drastically cutting "
-                "agent tool-use count. Returns proposal_ids per section and a "
-                "flat summary. Set auto_accept=false to review each section's "
-                "chords before bass/melody layers are computed from them."
+                "agent tool-use count. Set auto_accept=false to review each "
+                "section's chords before bass/melody layers are computed from "
+                "them. "
+                "If no form has been committed yet (set_form was not called), "
+                "the form is auto-derived from the sections array — each "
+                "section is sized to len(roman_numerals) * bars_per_chord. "
+                "Repeated names are disambiguated ('verse','verse' → "
+                "'verse','verse.2'); the resolved names show up in the "
+                "per-section response entries. "
+                "Returns a lean summary (proposal_ids + kinds + chord symbols "
+                "per section, a compact digest of the resulting song, and "
+                "only the output file paths for audio/score) — no raw note "
+                "arrays. Call observe (compact) or view_clip for inspection."
             ),
             inputSchema={
                 "type": "object",
@@ -391,21 +696,60 @@ async def _list_tools() -> list[Tool]:
                                     },
                                     "required": ["roman_numerals"],
                                 },
-                                "drums": {"type": "object"},
-                                "bass": {"type": "object"},
-                                "melody": {"type": "object"},
+                                "drums": _drums_subschema(),
+                                "bass": _bass_subschema(),
+                                "melody": _melody_subschema(),
                             },
                             "required": ["section", "chords"],
                         },
                     },
                     "auto_accept": {"type": "boolean", "default": True},
                     "default_drums": {
-                        "type": "object",
+                        **_drums_subschema(),
                         "description": "Applied to every section that doesn't set its own drums. Same fields as write_drum_pattern.",
                     },
                     "default_bass": {
-                        "type": "object",
+                        **_bass_subschema(),
                         "description": "Applied to every section that doesn't set its own bass. Same fields as write_bassline.",
+                    },
+                    "render_audio": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "After all sections are built+accepted, kick off a "
+                            "background render of song.wav/song.mp3 (+ stems) "
+                            "under out_dir. Requires auto_accept=true. The "
+                            "render runs on a daemon thread so this call "
+                            "returns immediately — poll the result_sidecar "
+                            "path in the audio field (status flips from "
+                            "'rendering' to 'done') or just call play_song "
+                            "later. Partial state is persisted to "
+                            "last_build.json before rendering starts, so "
+                            "a render crash can never lose the composition."
+                        ),
+                    },
+                    "render_score": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "After building, kick off a background score "
+                            "export (score.musicxml always; score.png if "
+                            "MuseScore 4 is installed). Requires "
+                            "auto_accept=true. Like render_audio, this returns "
+                            "immediately and writes a result sidecar the "
+                            "caller can poll."
+                        ),
+                    },
+                    "open_after_build": {
+                        "type": "boolean",
+                        "default": False,
+                        "description": (
+                            "Legacy one-shot flag. Ignored when render_audio "
+                            "or render_score is true (the render is now "
+                            "backgrounded, so there's nothing to open yet). "
+                            "Call play_song / view_score after the sidecar "
+                            "flips to status=done."
+                        ),
                     },
                 },
                 "required": ["sections"],
@@ -508,18 +852,9 @@ async def _list_tools() -> list[Tool]:
                         },
                         "required": ["roman_numerals"],
                     },
-                    "drums": {
-                        "type": "object",
-                        "description": "Optional. { style?, intensity?, track_name? }",
-                    },
-                    "bass": {
-                        "type": "object",
-                        "description": "Optional. { style?, track_name?, seed? }",
-                    },
-                    "melody": {
-                        "type": "object",
-                        "description": "Optional. Same fields as propose_melody (lyrics, contour, rhythm, range_lo, range_hi, max_leap, seed, track_name).",
-                    },
+                    "drums": _drums_subschema(),
+                    "bass": _bass_subschema(),
+                    "melody": _melody_subschema(),
                     "auto_accept": {"type": "boolean", "default": True},
                 },
                 "required": ["section", "chords"],
@@ -703,13 +1038,92 @@ async def _list_tools() -> list[Tool]:
                 "required": ["track_name", "section", "note_index"],
             },
         ),
+        Tool(
+            name="view_score",
+            description=(
+                "Export the current SongState as engraved sheet music. Always "
+                "writes {out}/score.musicxml (openable in any notation app). "
+                "Also writes {out}/score.png when MuseScore 4 is installed — "
+                "detected automatically. Set open=true (default) to pop the "
+                "PNG/MusicXML in the OS default viewer so the user sees it "
+                "immediately without hunting in the out folder."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "basename": {"type": "string", "default": "score"},
+                    "emit_png": {"type": "boolean", "default": True},
+                    "open": {"type": "boolean", "default": True},
+                },
+            },
+        ),
+        Tool(
+            name="play_song",
+            description=(
+                "Open {out}/song.mp3 in the OS default media player (falls "
+                "back to song.wav if mp3 wasn't rendered). Call after "
+                "build_song / render_song to hear the result without manually "
+                "hunting in the out folder."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "basename": {"type": "string", "default": "song"},
+                },
+            },
+        ),
+        Tool(
+            name="render_song",
+            description=(
+                "Render the current SongState to listenable audio. Emits "
+                "{out}/song.wav (always) and {out}/song.mp3 (if ffmpeg is "
+                "installed) plus per-role stems ({basename}__melody.wav, "
+                "__chords.wav, __bass.wav, __drums.wav) so individual tracks "
+                "can be swapped out later (e.g., replace the melody stem with "
+                "a vocaloid render and re-mix). Uses a built-in numpy synth "
+                "by default — zero install friction. "
+                "Defaults to background=true — the synth runs on a daemon "
+                "thread and this call returns immediately with a sidecar "
+                "pointer, because a 10-section song can easily exceed the "
+                "MCP client's per-call timeout. Set background=false only "
+                "when you want to block and wait (tests, short jingles)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "basename": {"type": "string", "default": "song"},
+                    "emit_stems": {"type": "boolean", "default": True},
+                    "emit_mp3": {"type": "boolean", "default": True},
+                    "background": {
+                        "type": "boolean",
+                        "default": True,
+                        "description": (
+                            "When true (default), kick the render onto a "
+                            "daemon thread and return a sidecar pointer "
+                            "immediately. When false, block until the "
+                            "render completes and return the full result."
+                        ),
+                    },
+                },
+            },
+        ),
     ]
 
 
 @server.call_tool()
 async def _call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
+    """Offload the sync dispatch onto a worker thread.
+
+    Previously ``_dispatch`` ran directly on the asyncio event loop, which
+    meant a long ``render_song`` (or ``build_song`` with ``render_audio=true``)
+    blocked *every* subsequent tool call — even a near-instant ``observe`` —
+    until the synth finished. With ``to_thread`` the loop stays responsive and
+    other tool calls proceed in parallel. Slow renders snapshot the state up
+    front (see ``_start_background_render``) so a concurrent mutation on the
+    SongState singleton can't corrupt an in-flight render.
+    """
     try:
-        return _dispatch(name, arguments or {})
+        return await asyncio.to_thread(_dispatch, name, arguments or {})
     except KeyError as e:
         return _json({"error": f"not found: {e}"})
     except Exception as e:
@@ -739,9 +1153,16 @@ def _dispatch(name: str, args: dict[str, Any]) -> list[TextContent]:
 
     if name == "observe":
         bridge = get_bridge()
-        d = st.to_dict()
+        if bool(args.get("verbose", False)):
+            d = st.to_dict()
+            d["reaper"] = bridge.status()
+            d["pending_proposal_ids"] = list(st.proposals.keys())
+            d["verbose"] = True
+            return _json(d)
+        d = st.summary()
         d["reaper"] = bridge.status()
         d["pending_proposal_ids"] = list(st.proposals.keys())
+        d["verbose"] = False
         return _json(d)
 
     if name == "suggest_form":
@@ -828,10 +1249,58 @@ def _dispatch(name: str, args: dict[str, Any]) -> list[TextContent]:
         auto_accept = bool(args.get("auto_accept", True))
         default_drums = args.get("default_drums") or None
         default_bass = args.get("default_bass") or None
+        sections_arg = args["sections"]
+
+        # Auto-derive the form if no set_form call has landed yet. Without
+        # this, a vanilla new_song → build_song sequence fails with a cryptic
+        # `no such section: 'Intro'` from deep inside _build_chords_proposal,
+        # because generators look up sections by name. Size each section to
+        # len(roman_numerals) * bars_per_chord — that's exactly the span the
+        # chord clip will occupy, so nothing hangs off the end.
+        # When the caller has *already* committed a form, we don't touch it;
+        # but if their spec names don't match that form at all, surface a
+        # targeted error instead of letting section_by_name raise KeyError.
+        missing = [
+            s["section"] for s in sections_arg
+            if not any(existing.name == s["section"] for existing in st.sections)
+        ]
+        resolved_names: list[str] = [s["section"] for s in sections_arg]
+        if missing and not st.sections:
+            derived: list[tuple[str, int]] = []
+            for spec in sections_arg:
+                chords_spec = spec.get("chords") or {}
+                roman = chords_spec.get("roman_numerals") or []
+                bpc = int(chords_spec.get("bars_per_chord", 1))
+                bars = max(1, len(roman) * bpc)
+                derived.append((spec["section"], bars))
+            form_mod.apply_form(st, derived)
+            bridge = get_bridge()
+            for s in st.sections:
+                bridge.set_region(s.start_bar, s.start_bar + s.bars, s.name)
+            # apply_form disambiguates repeats (verse, verse → verse, verse.2),
+            # so the dispatch below must use the resolved names — otherwise
+            # both iterations would look up "verse" and clobber the first clip.
+            resolved_names = [s.name for s in st.sections]
+        elif missing:
+            return _json({
+                "error": (
+                    f"sections {missing!r} not in current form "
+                    f"{[s.name for s in st.sections]!r}. "
+                    f"Call set_form first, or start fresh with new_song "
+                    f"so build_song can auto-derive the form from this "
+                    f"sections array."
+                ),
+                "type": "UnknownSection",
+                "missing": missing,
+                "existing_sections": [s.name for s in st.sections],
+            })
+
         out_sections: list[dict[str, Any]] = []
-        for spec in args["sections"]:
+        section_errors: list[dict[str, Any]] = []
+        for idx, spec in enumerate(sections_arg):
+            section_name = resolved_names[idx]
             render_args: dict[str, Any] = {
-                "section": spec["section"],
+                "section": section_name,
                 "chords": spec["chords"],
                 "auto_accept": auto_accept,
             }
@@ -847,12 +1316,127 @@ def _dispatch(name: str, args: dict[str, Any]) -> list[TextContent]:
                 render_args["melody"] = spec["melody"]
             # Reuse the render_section handler logic.
             rendered = _dispatch("render_section", render_args)
-            out_sections.append(json.loads(rendered[0].text))
-        return _json({
-            "ok": True,
+            parsed = json.loads(rendered[0].text)
+            if isinstance(parsed, dict) and "error" in parsed:
+                section_errors.append({"section": spec["section"], **parsed})
+                continue
+            # Trim the per-section record to what callers actually need: id
+            # list, kind list, chord symbols, top-line summaries. The full
+            # SongState never leaves this function.
+            out_sections.append({
+                "section": parsed.get("section"),
+                "proposal_ids": parsed.get("proposal_ids", []),
+                "proposal_count": len(parsed.get("proposal_ids", [])),
+                "kinds": sorted(parsed.get("summaries", {}).keys()),
+                "chord_symbols": parsed.get("chord_symbols", []),
+                "auto_accepted": parsed.get("auto_accepted", auto_accept),
+            })
+        audio: dict[str, Any] = {}
+        score: dict[str, Any] = {}
+        out_dir = get_bridge().out_dir
+
+        # Persist the build result BEFORE starting any render. If the synth
+        # hangs or the client gives up on the response, the user can still
+        # recover every proposal_id / chord_symbol / section summary from
+        # out_dir/last_build.json without rebuilding the song.
+        build_record = {
+            "ok": not section_errors,
             "sections": out_sections,
-            "total_proposals": sum(len(s.get("proposal_ids", [])) for s in out_sections),
+            "section_errors": section_errors,
+            "total_proposals": sum(s.get("proposal_count", 0) for s in out_sections),
+            "digest": st.summary(),
+        }
+        try:
+            _write_json_atomic(out_dir / "last_build.json", build_record)
+        except OSError:
+            # Non-fatal — the sidecar is a recovery aid, not a hard contract.
+            pass
+
+        want_audio = auto_accept and bool(args.get("render_audio", False))
+        want_score = auto_accept and bool(args.get("render_score", False))
+        open_after = bool(args.get("open_after_build", False))
+
+        if want_audio:
+            audio = _start_background_render(
+                st,
+                out_dir,
+                basename="song",
+                emit_stems=True,
+                emit_mp3=True,
+                sidecar_name="song.render_result.json",
+            )
+        if want_score:
+            score = _start_background_score(st, out_dir, basename="score", emit_png=True)
+
+        # open_after_build only makes sense for synchronous renders — the
+        # target file doesn't exist yet when we return. Surface that instead
+        # of silently dropping the flag.
+        opened: dict[str, str | None] = {}
+        if open_after and (want_audio or want_score):
+            opened["note"] = (
+                "open_after_build ignored: render is running in the background. "
+                "call play_song / view_score once the sidecar flips to status=done."
+            )
+
+        return _json({
+            **build_record,
+            "audio": audio,
+            "score": score,
+            "opened": opened,
+            "last_build_sidecar": str(out_dir / "last_build.json"),
         })
+
+    if name == "render_song":
+        basename = args.get("basename", "song")
+        emit_stems = bool(args.get("emit_stems", True))
+        emit_mp3 = bool(args.get("emit_mp3", True))
+        out_dir = get_bridge().out_dir
+        # Default to background so a slow render doesn't trip the MCP client
+        # timeout. Callers that want to block (tests, short renders) opt out.
+        if bool(args.get("background", True)):
+            return _json(_start_background_render(
+                st,
+                out_dir,
+                basename=basename,
+                emit_stems=emit_stems,
+                emit_mp3=emit_mp3,
+                sidecar_name=f"{basename}.render_result.json",
+            ))
+        result = _render_song(
+            st,
+            out_dir,
+            basename=basename,
+            emit_stems=emit_stems,
+            emit_mp3=emit_mp3,
+        )
+        return _json(result)
+
+    if name == "view_score":
+        basename = args.get("basename", "score")
+        emit_png = bool(args.get("emit_png", True))
+        do_open = bool(args.get("open", True))
+        out_dir = get_bridge().out_dir
+        result = _export_score(st, out_dir, basename=basename, emit_png=emit_png)
+        opened: str | None = None
+        if do_open:
+            target = result["png"] or result["musicxml"]
+            if target and open_with_default_app(Path(target)):
+                opened = target
+        return _json({**result, "opened": opened})
+
+    if name == "play_song":
+        basename = args.get("basename", "song")
+        out_dir = get_bridge().out_dir
+        mp3 = out_dir / f"{basename}.mp3"
+        wav = out_dir / f"{basename}.wav"
+        target = mp3 if mp3.exists() else wav if wav.exists() else None
+        if target is None:
+            return _json({
+                "ok": False,
+                "error": f"no {basename}.mp3 or {basename}.wav in {out_dir} — run render_song / build_song first",
+            })
+        launched = open_with_default_app(target)
+        return _json({"ok": launched, "played": str(target)})
 
     if name == "view_clip":
         track_name = args["track_name"]

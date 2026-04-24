@@ -20,6 +20,8 @@ from ..state import Clip, Note
 
 Contour = Literal["arch", "descending", "ascending", "wave", "flat"]
 
+MELODY_CONTOURS: tuple[str, ...] = ("arch", "descending", "ascending", "wave", "flat")
+
 
 @dataclass
 class MelodyCandidate:
@@ -42,6 +44,10 @@ def propose_melody(
 
     If rhythm is empty, nothing is generated.
     """
+    if contour not in MELODY_CONTOURS:
+        raise ValueError(
+            f"unknown melody contour {contour!r}; expected one of {list(MELODY_CONTOURS)}"
+        )
     rng = random.Random(seed)
     if not rhythm:
         return MelodyCandidate(notes=[], summary="empty rhythm — no melody generated")
@@ -86,8 +92,10 @@ def propose_melody(
         else:
             pool = scale_pcs
 
-        pitch = _choose_pitch(tgt, pool, prev_pitch=prev_pitch, max_leap=max_leap, rng=rng)
-        pitch = max(lo, min(hi, pitch))
+        pitch = _choose_pitch(
+            tgt, pool, prev_pitch=prev_pitch, max_leap=max_leap, rng=rng,
+            range_lo=lo, range_hi=hi,
+        )
         notes.append(Note(pitch=pitch, start_beat=start, duration_beats=dur, velocity=85))
         prev_pitch = pitch
 
@@ -163,29 +171,52 @@ def _choose_pitch(
     prev_pitch: int | None,
     max_leap: int,
     rng: random.Random,
+    range_lo: int,
+    range_hi: int,
 ) -> int:
     """Pick the MIDI pitch whose pitch class ∈ pool_pc and whose octave
     position is closest to ``target`` — but not more than ``max_leap``
-    semitones from ``prev_pitch``.
+    semitones from ``prev_pitch``, and always inside ``[range_lo, range_hi]``.
+
+    The range filter happens during candidate generation, not after, so
+    clamping can never smuggle a chromatic pitch-class into the melody
+    (e.g. clamping an out-of-range C to a ``range_hi`` of 85 used to
+    produce a C# that wasn't in the chosen pool).
     """
+    if range_hi < range_lo:
+        range_lo, range_hi = range_hi, range_lo
     if not pool_pc:
         pool_pc = list(range(12))
+
+    # Generate every in-pool pitch inside the range, then rank by distance.
     candidates: list[int] = []
     for pc in pool_pc:
-        # nearest two octaves to target
-        base = target - (target % 12) + pc
-        for cand in (base - 12, base, base + 12):
-            candidates.append(cand)
-    # Rank by distance to target, then by small leap from prev.
+        # Walk every octave whose pitch class == pc and keep the ones in range.
+        p = pc + 12 * max(0, (range_lo - pc) // 12)
+        while p <= range_hi:
+            if p >= range_lo:
+                candidates.append(p)
+            p += 12
+
+    # Fallback: no pool pitch fits in the range (very narrow vocal_range with
+    # a sparse scale). Grab the closest in-pool pitch outside the range; it's
+    # better to drift a little than to emit an out-of-pool chromatic note.
+    if not candidates:
+        for pc in pool_pc:
+            for k in range(-2, 3):
+                candidates.append(pc + 12 * ((range_lo // 12) + k))
+
+    clamped_target = max(range_lo, min(range_hi, target))
+
     def score(c: int) -> float:
-        s = abs(c - target)
+        s = abs(c - clamped_target)
         if prev_pitch is not None:
             leap = abs(c - prev_pitch)
             if leap > max_leap:
                 s += 100
             s += 0.3 * leap
         return s
+
     candidates.sort(key=score)
-    # Mild randomness among the top 3 for variety.
     top = candidates[:3]
     return rng.choice(top)

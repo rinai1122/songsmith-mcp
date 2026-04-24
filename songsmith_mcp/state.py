@@ -114,6 +114,57 @@ class SongState:
             "explain_level": self.explain_level,
         }
 
+    def summary(self) -> dict[str, Any]:
+        """Compact, MCP-safe digest — no per-note data.
+
+        Use this anywhere you would otherwise dump ``to_dict``. A 40-bar
+        4-track song expands ``to_dict`` into ~150 KB of JSON (every note of
+        every clip), which blows past most MCP payload limits; this digest
+        stays under ~2 KB regardless of song length by reporting counts
+        only. Callers who genuinely need the raw notes should reach for
+        ``view_clip`` or ``to_dict`` directly.
+        """
+        tracks_digest: dict[str, Any] = {}
+        for name, tr in self.tracks.items():
+            total_notes = sum(len(c.notes) for c in tr.clips)
+            tracks_digest[name] = {
+                "role": tr.role,
+                "clip_count": len(tr.clips),
+                "note_count": total_notes,
+                "clips": [
+                    {
+                        "section": c.section,
+                        "start_bar": c.start_bar,
+                        "length_bars": c.length_bars,
+                        "note_count": len(c.notes),
+                    }
+                    for c in tr.clips
+                ],
+            }
+        proposals_digest = [
+            {
+                "id": p.id,
+                "kind": p.kind,
+                "section": p.section,
+                "track": p.track,
+                "summary": p.summary,
+            }
+            for p in self.proposals.values()
+        ]
+        return {
+            "key": self.key,
+            "tempo": self.tempo,
+            "time_sig": list(self.time_sig),
+            "style_hint": self.style_hint,
+            "explain_level": self.explain_level,
+            "project_path": self.project_path,
+            "sections": [asdict(s) for s in self.sections],
+            "tracks": tracks_digest,
+            "pending_proposals": proposals_digest,
+            "pending_proposal_count": len(self.proposals),
+            "total_bars": self.total_bars(),
+        }
+
     def save(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(self.to_dict(), indent=2))
 

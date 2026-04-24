@@ -4,6 +4,7 @@ syllables preferentially placed on strong beats of the bar.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -27,6 +28,8 @@ DEFAULT_RHYTHMS = {
     "waltz":         [(0.0, 1.0), (1.0, 1.0), (2.0, 1.0)],  # 3/4
 }
 
+RHYTHM_TEMPLATES: tuple[str, ...] = tuple(DEFAULT_RHYTHMS.keys())
+
 
 def align_lyrics_to_rhythm(
     lyrics: str,
@@ -38,40 +41,74 @@ def align_lyrics_to_rhythm(
 
     - If ``rhythm`` is a string, we expand that template bar by bar until we
       have one rhythmic slot per syllable.
-    - Stressed syllables that would land on an off-beat get swapped with an
-      adjacent slot when feasible, so stresses line up with beats 1 and 3.
+    - If ``lyrics`` is multi-line (split on newlines or end-punctuation) and
+      ``bars_hint`` is given with at least one bar per phrase, each phrase
+      gets its own bar window so the melody breathes across the whole
+      section instead of front-loading all syllables.
     """
-    syls = [s for s in syllabify(lyrics) if _is_vocal(s)]
-    if not syls:
-        return AlignedLine(notes=[], syllables=[], bars_used=0.0)
-
     beats_per_bar = time_sig[0] * (4 / time_sig[1])
 
     if isinstance(rhythm, str):
-        template = DEFAULT_RHYTHMS.get(rhythm, DEFAULT_RHYTHMS["eighths"])
+        if rhythm not in DEFAULT_RHYTHMS:
+            raise ValueError(
+                f"unknown rhythm {rhythm!r}; expected one of {list(RHYTHM_TEMPLATES)}"
+            )
+        template = DEFAULT_RHYTHMS[rhythm]
     else:
         template = list(rhythm)
 
-    slots: list[tuple[float, float]] = []
-    bar_idx = 0
-    while len(slots) < len(syls):
-        bar_offset = bar_idx * beats_per_bar
-        for start, dur in template:
-            slots.append((start + bar_offset, dur))
-            if len(slots) >= len(syls):
-                break
-        bar_idx += 1
-        if bars_hint is not None and bar_idx >= bars_hint and len(slots) >= len(syls):
-            break
+    phrases = _split_into_phrases(lyrics)
+    if not phrases:
+        return AlignedLine(notes=[], syllables=[], bars_used=0.0)
 
-    # Swap stress/off-beat misalignments where a cheap local swap fixes it.
-    for i, syl in enumerate(syls):
-        if syl.stress >= 2 and not _is_on_strong_beat(slots[i][0]):
-            # Try swapping with neighbours that are on strong beats.
-            for j in (i - 1, i + 1):
-                if 0 <= j < len(slots) and _is_on_strong_beat(slots[j][0]) and syls[j].stress < 2:
-                    slots[i], slots[j] = slots[j], slots[i]
-                    break
+    # Distribute phrases across the section when the caller tells us how
+    # many bars we have and we've got room for at least one bar per phrase.
+    if bars_hint is not None and len(phrases) > 1 and bars_hint >= len(phrases):
+        bars_per_phrase = bars_hint // len(phrases)
+        notes: list[Note] = []
+        syls_all: list[Syllable] = []
+        for i, phrase in enumerate(phrases):
+            phrase_syls = [s for s in syllabify(phrase) if _is_vocal(s)]
+            if not phrase_syls:
+                continue
+            slots = _pack_slots(
+                n_syllables=len(phrase_syls),
+                template=template,
+                beats_per_bar=beats_per_bar,
+                bars_cap=bars_per_phrase,
+            )
+            offset_beats = i * bars_per_phrase * beats_per_bar
+            for syl, (st, du) in zip(phrase_syls, slots):
+                notes.append(Note(
+                    pitch=0,
+                    start_beat=st + offset_beats,
+                    duration_beats=du,
+                    velocity=85,
+                    lyric=syl.text,
+                ))
+                syls_all.append(syl)
+        if not notes:
+            return AlignedLine(notes=[], syllables=[], bars_used=0.0)
+        bars_used = max(n.start_beat + n.duration_beats for n in notes) / beats_per_bar
+        return AlignedLine(notes=notes, syllables=syls_all, bars_used=bars_used)
+
+    # Single-phrase (or no-hint) path: pack syllables contiguously from bar 0.
+    joined = " ".join(phrases)
+    syls = [s for s in syllabify(joined) if _is_vocal(s)]
+    if not syls:
+        return AlignedLine(notes=[], syllables=[], bars_used=0.0)
+
+    slots = _pack_slots(
+        n_syllables=len(syls),
+        template=template,
+        beats_per_bar=beats_per_bar,
+        bars_cap=bars_hint,
+    )
+
+    # Lyrics must be sung in text order, so slots must stay chronological —
+    # any stress-to-strong-beat alignment has to come from template choice,
+    # not post-hoc swaps. (Earlier code swapped adjacent slots here, which
+    # reversed syllable time order within words like "lone-ly".)
 
     notes = [
         Note(pitch=0, start_beat=s[0], duration_beats=s[1], velocity=85, lyric=syl.text)
@@ -94,7 +131,32 @@ def _is_vocal(s: Syllable) -> bool:
     return bool(s.text) and any(c.isalpha() for c in s.text)
 
 
-def _is_on_strong_beat(beat: float) -> bool:
-    """Strong beats are beats 1 and 3 of a 4/4 bar (⇒ even integer beat index)."""
-    beat_in_bar = beat % 4
-    return abs(beat_in_bar - round(beat_in_bar)) < 1e-3 and int(round(beat_in_bar)) % 2 == 0
+def _split_into_phrases(lyrics: str) -> list[str]:
+    """Break a lyric block into phrase-sized chunks on newlines and end
+    punctuation (``.``/``!``/``?``). Commas stay inline — they don't usually
+    warrant a whole-phrase break."""
+    parts = re.split(r"[\n.!?]+", lyrics)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _pack_slots(
+    n_syllables: int,
+    template: list[tuple[float, float]],
+    beats_per_bar: float,
+    bars_cap: int | None,
+) -> list[tuple[float, float]]:
+    """Lay ``template`` end-to-end, bar by bar, until we have at least
+    ``n_syllables`` slots. ``bars_cap``, if given, stops the expansion even
+    if that leaves slots short (the caller truncates note-side)."""
+    slots: list[tuple[float, float]] = []
+    bar_idx = 0
+    while len(slots) < n_syllables:
+        bar_offset = bar_idx * beats_per_bar
+        for start, dur in template:
+            slots.append((start + bar_offset, dur))
+            if len(slots) >= n_syllables:
+                break
+        bar_idx += 1
+        if bars_cap is not None and bar_idx >= bars_cap:
+            break
+    return slots[:n_syllables]

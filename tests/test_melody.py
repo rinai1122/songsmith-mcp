@@ -19,6 +19,40 @@ def test_melody_respects_vocal_range():
         assert 60 <= n.pitch <= 72
 
 
+def test_melody_never_emits_out_of_scale_pitch():
+    """Regression: when range_hi was just above an in-scale note, the old
+    post-hoc clamp could pin a chord-tone to a chromatic ceiling (e.g.
+    clamp C6 down to range_hi=85 → C#6, which isn't in C major)."""
+    chords = {0.0: [57, 60, 64]}  # A minor triad — section's emotional center
+    c_major_pcs = {0, 2, 4, 5, 7, 9, 11}
+    for seed in range(20):
+        cand = propose_melody(
+            "C major", chords, _rhythm(16),
+            contour="ascending", vocal_range=(57, 85), seed=seed,
+        )
+        for n in cand.notes:
+            assert n.pitch % 12 in c_major_pcs, (
+                f"seed {seed}: chromatic pitch {n.pitch} (pc={n.pitch % 12}) "
+                f"escaped the C-major scale"
+            )
+            assert 57 <= n.pitch <= 85, f"seed {seed}: pitch {n.pitch} out of range"
+
+
+def test_melody_narrow_range_still_stays_in_pool():
+    """Even a tight vocal_range that barely contains any chord tones must
+    not produce chromatic notes — we drift to the nearest in-pool pitch."""
+    chords = {0.0: [60, 64, 67]}  # C major
+    chord_pcs = {0, 4, 7}
+    cand = propose_melody(
+        "C major", chords, _rhythm(4),
+        contour="flat", vocal_range=(60, 64), seed=3,
+    )
+    for n in cand.notes:
+        # Tight range [60, 64] contains C4 (60) and E4 (64). Pool should
+        # restrict to those on strong beats; scale on off-beats adds D=62.
+        assert n.pitch % 12 in chord_pcs | {2, 5, 7, 9, 11}
+
+
 def test_melody_strong_beats_prefer_chord_tones():
     chords = {0.0: [60, 64, 67]}  # C major chord only
     # Strong beats = every beat on a whole integer.

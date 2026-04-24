@@ -11,6 +11,9 @@ from music21 import pitch as m21_pitch
 from ..state import Clip, Note
 
 
+BASS_STYLES = ("roots", "root_fifth", "walking", "syncopated", "arp")
+
+
 def write_bassline(
     chords_by_beat: dict[float, list[int]],
     section_name: str,
@@ -23,6 +26,10 @@ def write_bassline(
     seed: int | None = None,
 ) -> Clip:
     """Produce a bass clip in the chosen style."""
+    if style not in BASS_STYLES:
+        raise ValueError(
+            f"unknown bass style {style!r}; expected one of {list(BASS_STYLES)}"
+        )
     rng = random.Random(seed)
     beats_per_bar = time_sig[0] * (4 / time_sig[1])
 
@@ -69,8 +76,6 @@ def write_bassline(
             dur = (next_cb - cb) / len(arps)
             for j, p in enumerate(arps):
                 notes.append(Note(pitch=p, start_beat=cb + j * dur, duration_beats=dur, velocity=90))
-        else:
-            notes.append(Note(pitch=root, start_beat=cb, duration_beats=next_cb - cb, velocity=95))
 
     length_bars = int(total_beats / beats_per_bar)
     return Clip(

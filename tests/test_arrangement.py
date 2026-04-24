@@ -39,3 +39,33 @@ def test_walking_bass_has_four_notes_per_bar():
     chords = {0.0: [60, 64, 67], 4.0: [65, 69, 72]}
     clip = bass_mod.write_bassline(chords, "verse", "Bass", "C major", style="walking", bars=2)
     assert len(clip.notes) == 8  # 2 chords * 4 quarter-notes
+
+
+def test_drum_intensity_changes_note_density():
+    """Regression: every section used to sound identical because intensity
+    only nudged velocity. Light/normal/heavy must now produce materially
+    different patterns."""
+    light = drums_mod.write_drum_pattern("v", "Drums", style="pop", intensity="light", bars=2)
+    normal = drums_mod.write_drum_pattern("v", "Drums", style="pop", intensity="normal", bars=2)
+    heavy = drums_mod.write_drum_pattern("v", "Drums", style="pop", intensity="heavy", bars=2)
+    assert len(heavy.notes) > len(normal.notes) > len(light.notes)
+    # Heavy adds the open hi-hat voice that light/normal don't use.
+    assert drums_mod.OPEN_HAT in {n.pitch for n in heavy.notes}
+    assert drums_mod.OPEN_HAT not in {n.pitch for n in light.notes}
+    # Light drops the crash.
+    assert drums_mod.CRASH not in {n.pitch for n in light.notes}
+
+
+def test_drum_fill_places_toms_in_last_bar():
+    """fill=True should replace the last bar's second half with a tom fill
+    — the only way sections can meaningfully lift into the next one."""
+    no_fill = drums_mod.write_drum_pattern("v", "Drums", style="pop", bars=4, fill=False)
+    with_fill = drums_mod.write_drum_pattern("v", "Drums", style="pop", bars=4, fill=True)
+    # Toms only appear when fill is on.
+    tom_pitches = {drums_mod.TOM_LO, drums_mod.TOM_HI}
+    assert not (tom_pitches & {n.pitch for n in no_fill.notes})
+    last_bar_notes = [n for n in with_fill.notes if n.start_beat >= 12.0]
+    last_bar_pitches = {n.pitch for n in last_bar_notes}
+    assert tom_pitches & last_bar_pitches, (
+        f"fill=True produced no toms in last bar: {last_bar_pitches}"
+    )
