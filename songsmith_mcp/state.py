@@ -77,6 +77,11 @@ class SongState:
     sections: list[Section] = field(default_factory=list)
     tracks: dict[str, Track] = field(default_factory=dict)
     proposals: dict[str, Proposal] = field(default_factory=dict)
+    # Proposals keep after accept_proposal pops them from `proposals`. This is
+    # what keeps `explain(prop_id)` working after a proposal is committed —
+    # pedagogy shouldn't vanish the moment the user says "yes". Bounded so a
+    # multi-hour session doesn't grow unbounded state.
+    accepted_proposals: dict[str, Proposal] = field(default_factory=dict)
     project_path: str | None = None
     explain_level: str = "normal"  # "silent" | "normal" | "tutor"
 
@@ -110,6 +115,9 @@ class SongState:
             "sections": [asdict(s) for s in self.sections],
             "tracks": {n: asdict(t) for n, t in self.tracks.items()},
             "proposals": {i: asdict(p) for i, p in self.proposals.items()},
+            "accepted_proposals": {
+                i: asdict(p) for i, p in self.accepted_proposals.items()
+            },
             "project_path": self.project_path,
             "explain_level": self.explain_level,
         }

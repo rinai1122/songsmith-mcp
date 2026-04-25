@@ -12,6 +12,10 @@ from ..state import Proposal, get_state
 def explain(proposal_id: str) -> str:
     st = get_state()
     prop = st.proposals.get(proposal_id)
+    accepted = False
+    if not prop:
+        prop = st.accepted_proposals.get(proposal_id)
+        accepted = prop is not None
     if not prop:
         raise KeyError(f"unknown proposal: {proposal_id}")
 
@@ -20,6 +24,8 @@ def explain(proposal_id: str) -> str:
         return prop.summary
 
     body = [prop.summary]
+    if accepted:
+        body.append("(This proposal was accepted and is part of the song.)")
     if prop.rationale:
         body.append("")
         body.append(prop.rationale)

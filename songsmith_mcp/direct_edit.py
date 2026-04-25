@@ -217,3 +217,172 @@ def import_midi(
         "replaced": replaced,
         "written_midi": out_path,
     }
+
+
+# Grid names accepted by ``quantize_clip``. Values are in quarter-note beats;
+# 'T' marks a triplet grid (three notes in the space of two).
+_QUANTIZE_GRIDS: dict[str, float] = {
+    "1/4": 1.0,
+    "1/8": 0.5,
+    "1/8T": 1.0 / 3.0,
+    "1/16": 0.25,
+    "1/16T": 1.0 / 6.0,
+    "1/32": 0.125,
+}
+
+
+def create_empty_clip(
+    track_name: str,
+    section: str,
+    role: str | None = None,
+) -> dict[str, Any]:
+    """Create a blank clip on (track, section) so hand-composing can start
+    without a generator running first. If the track doesn't exist, it's made
+    with ``role`` (defaults to ``'midi'``). If a clip already exists on
+    (track, section), the call is a no-op and returns ``existed=true``.
+    """
+    st = get_state()
+    sec = st.section_by_name(section)
+    tr = st.ensure_track(track_name, role=role or "midi")
+    existing = [c for c in tr.clips if c.section == section]
+    if existing:
+        return {
+            "ok": True,
+            "existed": True,
+            "track": track_name,
+            "section": section,
+            "clip_index": tr.clips.index(existing[0]),
+            "note_count": len(existing[0].notes),
+        }
+    clip = Clip(
+        track=track_name,
+        section=section,
+        notes=[],
+        start_bar=sec.start_bar,
+        length_bars=sec.bars,
+    )
+    tr.clips.append(clip)
+    path = _rerender(clip)
+    return {
+        "ok": True,
+        "existed": False,
+        "track": track_name,
+        "section": section,
+        "clip_index": tr.clips.index(clip),
+        "start_bar": clip.start_bar,
+        "length_bars": clip.length_bars,
+        "written_midi": path,
+    }
+
+
+def duplicate_clip(
+    track_name: str,
+    from_section: str,
+    to_section: str,
+    *,
+    clip_index: int = 0,
+    target_track_name: str | None = None,
+    replace: bool = False,
+) -> dict[str, Any]:
+    """Copy a clip's notes into another section.
+
+    Notes keep their relative structure (same ``start_beat`` / duration /
+    velocity / lyric); only the clip's ``section`` / ``start_bar`` /
+    ``length_bars`` are re-targeted. When ``target_track_name`` is given the
+    copy lands on a different track (created if missing, same ``role`` as the
+    source). With ``replace=True`` an existing clip at the destination slot is
+    overwritten; otherwise a second clip is appended.
+    """
+    src_track, src_clip = _find_clip(track_name, from_section, clip_index)
+    st = get_state()
+    to_sec = st.section_by_name(to_section)
+    dest_track_name = target_track_name or track_name
+    dest_track = st.ensure_track(dest_track_name, role=src_track.role)
+
+    new_clip = Clip(
+        track=dest_track_name,
+        section=to_section,
+        notes=[
+            Note(
+                pitch=n.pitch,
+                start_beat=n.start_beat,
+                duration_beats=n.duration_beats,
+                velocity=n.velocity,
+                lyric=n.lyric,
+            )
+            for n in src_clip.notes
+        ],
+        start_bar=to_sec.start_bar,
+        length_bars=to_sec.bars,
+        chord_symbol=src_clip.chord_symbol,
+    )
+
+    in_section = [i for i, c in enumerate(dest_track.clips) if c.section == to_section]
+    if replace and in_section:
+        dest_track.clips[in_section[0]] = new_clip
+        replaced = True
+    else:
+        dest_track.clips.append(new_clip)
+        replaced = False
+
+    path = _rerender(new_clip)
+    return {
+        "ok": True,
+        "source": {"track": track_name, "section": from_section, "clip_index": clip_index},
+        "target": {
+            "track": dest_track_name,
+            "section": to_section,
+            "clip_index": dest_track.clips.index(new_clip),
+            "replaced": replaced,
+        },
+        "notes_copied": len(new_clip.notes),
+        "written_midi": path,
+    }
+
+
+def quantize_clip(
+    track_name: str,
+    section: str,
+    *,
+    grid: str = "1/16",
+    strength: float = 1.0,
+    quantize_duration: bool = False,
+    clip_index: int = 0,
+) -> dict[str, Any]:
+    """Snap note starts (and optionally durations) to ``grid``.
+
+    ``strength`` ∈ [0, 1] interpolates between the original start and the
+    fully-snapped position — 1.0 is hard quantize, 0.5 pulls halfway toward
+    the grid (the classic "gentle" DAW feel). Durations snap only when
+    ``quantize_duration=True`` and never go below one grid step (so very short
+    ornaments aren't silently deleted).
+    """
+    if grid not in _QUANTIZE_GRIDS:
+        raise ValueError(
+            f"unknown grid {grid!r}; expected one of {sorted(_QUANTIZE_GRIDS)}"
+        )
+    s = max(0.0, min(1.0, float(strength)))
+    step = _QUANTIZE_GRIDS[grid]
+
+    _, clip = _find_clip(track_name, section, clip_index)
+    moved = 0
+    for n in clip.notes:
+        snapped = round(n.start_beat / step) * step
+        new_start = n.start_beat + (snapped - n.start_beat) * s
+        if new_start != n.start_beat:
+            moved += 1
+        n.start_beat = new_start
+        if quantize_duration:
+            snapped_dur = round(n.duration_beats / step) * step
+            n.duration_beats = max(step, snapped_dur)
+    clip.notes.sort(key=lambda x: (x.start_beat, x.pitch))
+    path = _rerender(clip)
+    return {
+        "ok": True,
+        "track": track_name,
+        "section": section,
+        "grid": grid,
+        "strength": s,
+        "notes_moved": moved,
+        "written_midi": path,
+    }

@@ -61,13 +61,14 @@ Dedupe rule: same tool + substantively same symptom = duplicate.
   - scenario: 7
   - first seen: iteration 1
 
-- **explain fails on auto-accepted proposal IDs** (ux)
+- ~~**explain fails on auto-accepted proposal IDs** (ux)~~ — fixed 2026-04-24
   - tool: `mcp__songsmith__explain`
   - inputs: `proposal_id="prop_68947828"` just returned from `render_section` with `auto_accept=true`
   - observed: `{"error":"not found: 'unknown proposal: prop_68947828'"}`
   - expected: explain should work on accepted proposals, or the error should say "proposal was accepted and purged"
   - scenario: 7
   - first seen: iteration 1
+  - fix: `accept_proposal` now archives accepted proposals into `SongState.accepted_proposals` (FIFO-capped at 128). `explain` / `diff_proposal` consult both the pending and archived dicts; accepted responses are marked with a "(This proposal was accepted …)" line so callers don't confuse them for pending. Regressions in `tests/test_teacher_and_midi_creator.py::test_explain_survives_accept_proposal` + neighbors.
 
 - **new_song response dominated by noisy purge list** (ux)
   - tool: `mcp__songsmith__new_song`

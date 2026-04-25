@@ -25,6 +25,12 @@ from .arrangement import form as form_mod
 from . import direct_edit as edit_mod
 from .hitl import proposals as prop_mod
 from .hitl.explain import explain as _explain
+from .hitl.teacher import (
+    LESSONS as _LESSONS,
+    analyze_section as _analyze_section,
+    lesson as _lesson,
+    suggest_next_step as _suggest_next_step,
+)
 from .lyrics.align import DEFAULT_RHYTHMS, RHYTHM_TEMPLATES, align_lyrics_to_rhythm, as_rhythm_template
 from .lyrics.syllabify import count_syllables, syllabify
 from .reaper_bridge import get_bridge
@@ -1073,6 +1079,128 @@ async def _list_tools() -> list[Tool]:
             },
         ),
         Tool(
+            name="create_empty_clip",
+            description=(
+                "Start a blank clip on (track, section) so hand-composing can "
+                "begin without a generator (propose_melody / write_chords / …) "
+                "running first. Creates the track if it doesn't exist. If a "
+                "clip already exists on (track, section), no-ops and reports "
+                "existed=true."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "track_name": {"type": "string"},
+                    "section": {"type": "string"},
+                    "role": {
+                        "type": "string",
+                        "description": (
+                            "Role for a newly-created track "
+                            "('midi', 'melody', 'pad', 'vocal', 'lead'…). "
+                            "Defaults to 'midi'."
+                        ),
+                    },
+                },
+                "required": ["track_name", "section"],
+            },
+        ),
+        Tool(
+            name="duplicate_clip",
+            description=(
+                "Copy one clip's notes into another section (optionally onto a "
+                "different track). Preserves relative note timing, velocities, "
+                "and lyrics; resets the clip's start_bar / length_bars to match "
+                "the target section. Set replace=true to overwrite an existing "
+                "clip at the destination instead of appending a second one."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "track_name": {"type": "string"},
+                    "from_section": {"type": "string"},
+                    "to_section": {"type": "string"},
+                    "clip_index": {"type": "integer", "default": 0},
+                    "target_track_name": {
+                        "type": "string",
+                        "description": "Copy onto a different track. Defaults to track_name.",
+                    },
+                    "replace": {"type": "boolean", "default": False},
+                },
+                "required": ["track_name", "from_section", "to_section"],
+            },
+        ),
+        Tool(
+            name="quantize_clip",
+            description=(
+                "Snap note starts in one clip to a rhythmic grid. "
+                "strength=1.0 is hard quantize; 0.5 pulls halfway toward the "
+                "grid (classic 'gentle' DAW quantize). Grids: 1/4, 1/8, 1/8T "
+                "(triplets), 1/16, 1/16T, 1/32. Set quantize_duration=true to "
+                "snap durations too (never below one grid step)."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "track_name": {"type": "string"},
+                    "section": {"type": "string"},
+                    "grid": {
+                        "type": "string",
+                        "enum": ["1/4", "1/8", "1/8T", "1/16", "1/16T", "1/32"],
+                        "default": "1/16",
+                    },
+                    "strength": {"type": "number", "default": 1.0, "minimum": 0, "maximum": 1},
+                    "quantize_duration": {"type": "boolean", "default": False},
+                    "clip_index": {"type": "integer", "default": 0},
+                },
+                "required": ["track_name", "section"],
+            },
+        ),
+        Tool(
+            name="analyze_section",
+            description=(
+                "Teacher-mode analysis of one committed section. Walks every "
+                "track's clip in that section and returns Roman-numeral "
+                "harmony labels + functional zones (tonic / predominant / "
+                "dominant), melody range + contour + chord-tone hit rate on "
+                "strong beats, bass range, drum feel, plus a list of "
+                "pedagogical observations. Works on *accepted* content — "
+                "unlike `explain`, no proposal_id needed."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {"section": {"type": "string"}},
+                "required": ["section"],
+            },
+        ),
+        Tool(
+            name="lesson",
+            description=(
+                "Return a curated short lesson on a named music-theory topic. "
+                "Omit topic to list available topics. Topics include: "
+                + ", ".join(sorted(_LESSONS.keys()))
+                + "."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "enum": sorted(_LESSONS.keys()),
+                    },
+                },
+            },
+        ),
+        Tool(
+            name="suggest_next_step",
+            description=(
+                "Look at the current song state and recommend up to 3 next "
+                "actions — tool name + suggested args + one-line reason. "
+                "Ordered by priority. Used when the caller is unsure what to "
+                "do next; pairs well with explain_level='tutor'."
+            ),
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        Tool(
             name="render_song",
             description=(
                 "Render the current SongState to listenable audio. Emits "
@@ -1711,6 +1839,48 @@ def _dispatch(name: str, args: dict[str, Any]) -> list[TextContent]:
                 clip_index=int(args.get("clip_index", 0)),
             )
         )
+
+    if name == "create_empty_clip":
+        return _json(
+            edit_mod.create_empty_clip(
+                track_name=args["track_name"],
+                section=args["section"],
+                role=args.get("role"),
+            )
+        )
+
+    if name == "duplicate_clip":
+        return _json(
+            edit_mod.duplicate_clip(
+                track_name=args["track_name"],
+                from_section=args["from_section"],
+                to_section=args["to_section"],
+                clip_index=int(args.get("clip_index", 0)),
+                target_track_name=args.get("target_track_name"),
+                replace=bool(args.get("replace", False)),
+            )
+        )
+
+    if name == "quantize_clip":
+        return _json(
+            edit_mod.quantize_clip(
+                track_name=args["track_name"],
+                section=args["section"],
+                grid=args.get("grid", "1/16"),
+                strength=float(args.get("strength", 1.0)),
+                quantize_duration=bool(args.get("quantize_duration", False)),
+                clip_index=int(args.get("clip_index", 0)),
+            )
+        )
+
+    if name == "analyze_section":
+        return _json(_analyze_section(args["section"]))
+
+    if name == "lesson":
+        return _json(_lesson(args.get("topic")))
+
+    if name == "suggest_next_step":
+        return _json(_suggest_next_step())
 
     return _json({"error": f"unknown tool: {name}"})
 

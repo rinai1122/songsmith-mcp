@@ -13,6 +13,12 @@ from ..reaper_bridge import get_bridge
 from ..state import Clip, Proposal, SongState, get_state
 
 
+# Keep the last N accepted proposals queryable (for `explain` after accept).
+# A heavy `/test-songsmith` session can easily produce 40+ accepts; 128 is
+# generous without bloating the state dump in `observe(verbose=true)`.
+_ACCEPTED_ARCHIVE_MAX = 128
+
+
 def create_proposal(
     kind: str,
     section: str,
@@ -56,6 +62,13 @@ def accept_proposal(proposal_id: str) -> dict[str, Any]:
         path = bridge.insert_clip(clip, st, proposal_id=None)
         paths.append(path)
 
+    # Archive so `explain` / `diff_proposal` keep working after accept.
+    # FIFO-evict the oldest entry once we exceed the cap.
+    st.accepted_proposals[proposal_id] = prop
+    while len(st.accepted_proposals) > _ACCEPTED_ARCHIVE_MAX:
+        oldest_id = next(iter(st.accepted_proposals))
+        st.accepted_proposals.pop(oldest_id, None)
+
     return {
         "accepted": proposal_id,
         "track": prop.track,
@@ -76,7 +89,7 @@ def reject_proposal(proposal_id: str) -> dict[str, Any]:
 
 def diff_proposal(proposal_id: str) -> dict[str, Any]:
     st = get_state()
-    prop = st.proposals.get(proposal_id)
+    prop = st.proposals.get(proposal_id) or st.accepted_proposals.get(proposal_id)
     if not prop:
         raise KeyError(f"unknown proposal: {proposal_id}")
     bars_touched: set[int] = set()
