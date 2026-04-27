@@ -20,6 +20,7 @@ dependencies = [
 [project.optional-dependencies]
 reaper = ["python-reapy>=0.10"]
 dev = ["pytest>=7", "pytest-asyncio>=0.23"]
+vocal = ["nnsvs>=0.1", "pysinsy>=0.0.5"]
 
 [project.scripts]
 songsmith-mcp = "songsmith_mcp.server:main"

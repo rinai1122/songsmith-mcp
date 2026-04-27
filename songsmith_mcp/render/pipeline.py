@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +10,10 @@ from ..state import SongState
 from .encode import mix_stems, wav_to_mp3, write_wav
 from .merge import flatten
 from .synth import SAMPLE_RATE, RenderBackend, default_backend
+from .vocal import VocalBackend, VocalRequest, select_vocal_backend
+
+
+_VOCAL_ROLES = {"melody", "vocal"}
 
 
 def render_song(
@@ -19,16 +24,23 @@ def render_song(
     emit_stems: bool = True,
     emit_mp3: bool = True,
     backend: RenderBackend | None = None,
+    vocal_backend: VocalBackend | None = None,
 ) -> dict[str, Any]:
     """Render the current SongState to ``{out_dir}/{basename}.wav`` (+ .mp3).
 
     Stems are written as ``{basename}__{role}.wav`` when ``emit_stems`` is true,
-    so callers can swap individual tracks (e.g., replace ``__melody.wav`` with
-    a real vocaloid render and re-mix) without touching the rest.
+    so callers can swap individual tracks (replace ``__melody.wav`` with a
+    different vocal render and re-mix) without touching the rest.
+
+    The melody/vocal role is rendered through ``vocal_backend`` (selected via
+    ``SONGSMITH_VOCAL_BACKEND`` when not passed explicitly), so a configured
+    NNSVS or external SVS engine produces real singing instead of the formant
+    fallback or the legacy saw lead.
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     backend = backend or default_backend()
+    vocal_backend = vocal_backend or select_vocal_backend()
 
     stems, duration_s = flatten(state)
     if not stems:
@@ -41,7 +53,26 @@ def render_song(
 
     role_buffers: dict[str, Any] = {}
     for stem in stems:
-        buf = backend.render_stem(stem, duration_s)
+        if stem.role in _VOCAL_ROLES:
+            request = VocalRequest(
+                notes=stem.notes,
+                duration_s=duration_s,
+                sample_rate=SAMPLE_RATE,
+                tempo=state.tempo,
+                key=state.key,
+            )
+            try:
+                buf = vocal_backend.render(request)
+            except Exception as exc:  # noqa: BLE001 — never let a vocal engine break the mix
+                print(
+                    f"[songsmith] vocal backend {vocal_backend.name!r} raised "
+                    f"{type(exc).__name__}: {exc} — falling back to formant",
+                    file=sys.stderr,
+                )
+                from .vocal.formant import FormantBackend
+                buf = FormantBackend().render(request)
+        else:
+            buf = backend.render_stem(stem, duration_s)
         # Sum multiple tracks that share a role (e.g., two chord tracks) so
         # the mix bus gets one entry per role, not per track.
         if stem.role in role_buffers:
@@ -80,5 +111,6 @@ def render_song(
         "duration_s": round(duration_s, 3),
         "tracks_rendered": [s.track_name for s in stems],
         "backend": type(backend).__name__,
+        "vocal_backend": vocal_backend.name,
         "mp3_available": mp3_path is not None,
     }

@@ -169,6 +169,28 @@ every proposal carries a multi-paragraph rationale ("Using ii–V–I because
 the previous section ended on vi; this is a standard relative-major
 pivot"), so beginners learn theory by watching the agent work.
 
+## Vocal synthesis
+
+The melody/vocal role is rendered through a pluggable singing-voice
+backend so the mix can actually *sing the lyrics* instead of falling back
+to a saw lead. Selection via `SONGSMITH_VOCAL_BACKEND`:
+
+| Backend    | Setup                                                                       | Output                                                |
+|------------|-----------------------------------------------------------------------------|-------------------------------------------------------|
+| `formant`  | none — pure numpy, always available                                         | vowel-shaped additive synth ("ah / ee / oo" singing) |
+| `nnsvs`    | `pip install nnsvs pysinsy` + `SONGSMITH_VOCAL_BANK=/path/to/release-dir`   | real neural SVS                                       |
+| `external` | `SONGSMITH_VOCAL_RENDER_CMD='renderer --in {input} --out {output}'`         | whatever your renderer produces                       |
+| `saw`      | none                                                                        | legacy saw-lead (pre-vocal-pipeline parity)           |
+| `auto`     | default — tries `nnsvs` → `external` → `formant`                            | best-available                                        |
+
+The `external` backend writes a JSON request (notes, lyrics, tempo, key,
+sample rate) to `{input}`, runs your command, and reads the resulting WAV
+from `{output}`. A reference NNSVS renderer ships at
+`examples/vocal_renderer_nnsvs.py`. Any vocal-backend exception is caught
+and falls back to `formant` so a misconfigured engine never breaks the
+mix — `render_song` returns the active backend in `result["vocal_backend"]`
+so you can verify which engine actually ran.
+
 ## Theory notes
 
 - **Chord voicing.** Block chords are voiced root-position: the root sits
